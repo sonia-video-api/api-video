@@ -1,21 +1,35 @@
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, Literal
 import os
 import json
 import uuid
+import base64
 import hashlib
 import secrets
-import base64
-import httpx
-from datetime import datetime, timezone
 import sqlite3
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
+import requests
+from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+APP_NAME = "MonAPI Video"
+DB_PATH = os.getenv("DB_PATH", "/tmp/jobs.db")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://api-video-4ajs.onrender.com")
+
+# Fal.ai
+FAL_API_KEY = os.getenv("FAL_API_KEY")
+FAL_MODEL = os.getenv("FAL_MODEL", "fal-ai/fast-video")
+
+# Replicate (optionnel)
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+
+DEFAULT_PROVIDER = "fal" if FAL_API_KEY else ("replicate" if REPLICATE_API_TOKEN else None)
 
 app = FastAPI(
-    title="MonAPI Video - 100% Online",
-    description="API de génération de vidéos IA sur Render + GPU externe (Fal.ai / Replicate)",
-    version="2.0.0"
+    title=APP_NAME,
+    description="API de génération de vidéos IA — Render + GPU externe Fal.ai",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -25,26 +39,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ CONFIGURATION ============
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-FAL_API_KEY = os.getenv("FAL_API_KEY")
 
-PRICING = {
-    "replicate": {"per_second": 0.08, "min": 0.50},
-    "fal": {"per_second": 0.05, "min": 0.30},
-}
-
-DEFAULT_PROVIDER = "fal" if FAL_API_KEY else ("replicate" if REPLICATE_API_TOKEN else None)
-
-DB_PATH = os.getenv("DB_PATH", "/tmp/jobs.db")
-
-def get_db():
+# ---------------------------
+# DB (SQLite)
+# ---------------------------
+def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def init_db():
     conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id TEXT PRIMARY KEY,
+            key_hash TEXT UNIQUE NOT NULL,
+            name TEXT,
+            created_at TEXT
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
@@ -53,38 +71,32 @@ def init_db():
             provider TEXT,
             prompt TEXT NOT NULL,
             params TEXT,
-            cost_estimate REAL,
             result_url TEXT,
             error TEXT,
             created_at TEXT,
-            updated_at TEXT,
-            provider_job_id TEXT,
-            status_url TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id TEXT PRIMARY KEY,
-            key_hash TEXT UNIQUE NOT NULL,
-            name TEXT,
-            credits_spent REAL DEFAULT 0,
-            created_at TEXT
+            updated_at TEXT
         )
     """)
     conn.commit()
     conn.close()
 
+
 @app.on_event("startup")
 def startup():
     init_db()
 
-# ============ AUTH ============
+
+# ---------------------------
+# Auth
+# ---------------------------
 def hash_key(key: str) -> str:
-    return hashlib.sha256(key.encode()).hexdigest()[:32]
+    return hashlib.sha256(key.encode()).hexdigest()
+
 
 def generate_api_key():
     raw = "mak_" + base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
     return raw, hash_key(raw)
+
 
 def verify_key(key: str) -> Optional[dict]:
     if not key or not key.startswith("mak_"):
@@ -96,207 +108,154 @@ def verify_key(key: str) -> Optional[dict]:
     conn.close()
     return dict(row) if row else None
 
-# ============ MODÈLES ============
+
+# ---------------------------
+# Schemas
+# ---------------------------
 class VideoRequest(BaseModel):
-    prompt: str = Field(..., min_length=5, max_length=1000)
-    seconds: int = Field(default=6, ge=2, le=10)
+    prompt: str = Field(..., min_length=5, max_length=2000)
+    seconds: int = Field(default=5, ge=1, le=6)
     fps: int = Field(default=16, ge=8, le=24)
-    width: int = Field(default=768, ge=256, le=1024)
-    height: int = Field(default=432, ge=256, le=768)
-    provider: Optional[Literal["fal", "replicate"]] = None
+    width: int = Field(default=768, ge=256, le=1280)
+    height: int = Field(default=432, ge=256, le=720)
+    seed: Optional[int] = None
+    provider: Optional[str] = None
+
 
 class JobResponse(BaseModel):
     id: str
     status: str
-    estimated_cost_usd: float
     message: str
+
 
 class JobStatus(BaseModel):
     id: str
     status: str
     prompt: str
     provider: Optional[str] = None
-    cost_usd: Optional[float] = None
     result_url: Optional[str] = None
     error: Optional[str] = None
     created_at: str
-    progress: int = 0
+    updated_at: str
 
-# ============ GÉNÉRATION EXTERNE ============
-async def generate_with_fal(prompt: str, params: dict) -> dict:
+
+# ---------------------------
+# Fal.ai — génération réelle
+# ---------------------------
+def fal_generate_video(prompt: str, seconds: int, fps: int, width: int, height: int, seed: Optional[int]) -> str:
+    """Appel synchrone à Fal.ai pour générer une vraie vidéo."""
     if not FAL_API_KEY:
-        raise Exception("FAL_API_KEY non configuré dans les variables d'environnement Render")
+        raise RuntimeError("FAL_API_KEY non configuré sur Render")
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://queue.fal.run/fal-ai/fast-svd-lcm",
-            headers={"Authorization": f"Key {FAL_API_KEY}"},
-            json={
-                "prompt": prompt,
-                "num_frames": params["seconds"] * params["fps"],
-                "fps": params["fps"],
-                "width": params["width"],
-                "height": params["height"],
-            },
-            timeout=30.0
-        )
-        if response.status_code not in (200, 201):
-            raise Exception(f"Fal API error {response.status_code}: {response.text}")
-        result = response.json()
-        return {
-            "provider_job_id": result.get("request_id"),
-            "status_url": result.get("status_url") or f"https://queue.fal.run/fal-ai/fast-svd-lcm/requests/{result.get('request_id')}/status",
-            "estimated_cost": params["seconds"] * PRICING["fal"]["per_second"]
-        }
+    url = f"https://fal.run/{FAL_MODEL}"
 
-async def generate_with_replicate(prompt: str, params: dict) -> dict:
-    if not REPLICATE_API_TOKEN:
-        raise Exception("REPLICATE_API_TOKEN non configuré dans les variables d'environnement Render")
+    headers = {
+        "Authorization": f"Key {FAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.replicate.com/v1/predictions",
-            headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"},
-            json={
-                "version": "stability-ai/stable-video-diffusion:3f0457e4619daac51203dedb472816fd4af51f3149fa7a9e0b5ffcf1b8172438",
-                "input": {
-                    "prompt": prompt,
-                    "num_frames": params["seconds"] * params["fps"],
-                    "fps": params["fps"],
-                    "width": params["width"],
-                    "height": params["height"]
-                }
-            },
-            timeout=30.0
-        )
-        if response.status_code != 201:
-            raise Exception(f"Replicate error {response.status_code}: {response.text}")
-        result = response.json()
-        return {
-            "provider_job_id": result["id"],
-            "status_url": result["urls"]["get"],
-            "estimated_cost": PRICING["replicate"]["min"] + (params["seconds"] * PRICING["replicate"]["per_second"])
-        }
+    payload: Dict[str, Any] = {
+        "prompt": prompt,
+        "duration": seconds,
+        "fps": fps,
+        "width": width,
+        "height": height,
+    }
+    if seed is not None:
+        payload["seed"] = seed
 
-async def check_fal_status(status_url: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            status_url,
-            headers={"Authorization": f"Key {FAL_API_KEY}"},
-            timeout=10.0
-        )
-        if response.status_code == 200:
-            data = response.json()
-            video = data.get("video")
-            video_url = video.get("url") if isinstance(video, dict) else video
-            return {
-                "status": "completed" if video_url else "processing",
-                "video_url": video_url,
-            }
-        return {"status": "processing"}
+    r = requests.post(url, json=payload, headers=headers, timeout=600)
+    if r.status_code != 200:
+        raise RuntimeError(f"Fal.ai erreur {r.status_code}: {r.text}")
 
-async def check_replicate_status(status_url: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            status_url,
-            headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"},
-            timeout=10.0
-        )
-        if response.status_code == 200:
-            data = response.json()
-            st = data.get("status")
-            return {
-                "status": "completed" if st == "succeeded" else ("failed" if st == "failed" else "processing"),
-                "video_url": data.get("output") if isinstance(data.get("output"), str) else None,
-                "error": data.get("error")
-            }
-        return {"status": "processing"}
+    data = r.json()
 
-# ============ TÂCHE DE FOND ============
-async def process_video_job(job_id: str, prompt: str, params: dict, provider: str, api_key_id: str):
+    # Fal retourne selon le modèle : video_url, video, ou outputs[0].url
+    video_url = data.get("video_url") or data.get("video")
+    if not video_url and isinstance(data.get("outputs"), list) and data["outputs"]:
+        video_url = data["outputs"][0].get("url")
+    if not video_url and isinstance(data.get("video"), dict):
+        video_url = data["video"].get("url")
+
+    if not video_url:
+        raise RuntimeError(f"Fal.ai n'a pas retourné d'URL vidéo: {json.dumps(data)[:500]}")
+
+    return video_url
+
+
+# ---------------------------
+# Tâche de fond
+# ---------------------------
+def process_video_job(job_id: str, prompt: str, params: dict, provider: str):
     conn = get_db()
     try:
         conn.execute(
             "UPDATE jobs SET status='processing', updated_at=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(), job_id)
+            (now_iso(), job_id)
         )
         conn.commit()
 
         if provider == "fal":
-            result = await generate_with_fal(prompt, params)
+            video_url = fal_generate_video(
+                prompt=prompt,
+                seconds=params["seconds"],
+                fps=params["fps"],
+                width=params["width"],
+                height=params["height"],
+                seed=params.get("seed"),
+            )
         else:
-            result = await generate_with_replicate(prompt, params)
+            raise RuntimeError(f"Provider '{provider}' non supporté. Utilisez 'fal'.")
 
         conn.execute(
-            "UPDATE jobs SET provider_job_id=?, status_url=?, cost_estimate=?, updated_at=? WHERE id=?",
-            (result["provider_job_id"], result["status_url"], result["estimated_cost"],
-             datetime.now(timezone.utc).isoformat(), job_id)
+            "UPDATE jobs SET status='completed', result_url=?, updated_at=? WHERE id=?",
+            (video_url, now_iso(), job_id)
         )
         conn.commit()
-
-        # Polling jusqu'à complétion (max 5 min)
-        import asyncio
-        for _ in range(60):
-            await asyncio.sleep(5)
-            if provider == "fal":
-                status = await check_fal_status(result["status_url"])
-            else:
-                status = await check_replicate_status(result["status_url"])
-
-            if status["status"] == "completed":
-                conn.execute(
-                    "UPDATE jobs SET status='completed', result_url=?, updated_at=? WHERE id=?",
-                    (status.get("video_url"), datetime.now(timezone.utc).isoformat(), job_id)
-                )
-                conn.commit()
-                return
-            elif status["status"] == "failed":
-                raise Exception(status.get("error", "Génération échouée"))
-
-        raise Exception("Timeout: génération trop longue (>5 min)")
 
     except Exception as e:
         conn.execute(
             "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
-            (str(e), datetime.now(timezone.utc).isoformat(), job_id)
+            (str(e), now_iso(), job_id)
         )
         conn.commit()
     finally:
         conn.close()
 
-# ============ ENDPOINTS ============
+
+# ---------------------------
+# Endpoints
+# ---------------------------
 @app.get("/")
 def home():
     return {
-        "name": "MonAPI Video - 100% Online",
-        "version": "2.0.0",
-        "mode": "Render (API) + GPU externe (Fal.ai / Replicate)",
+        "name": APP_NAME,
+        "version": "3.0.0",
+        "provider_defaut": DEFAULT_PROVIDER or "AUCUN (configurez FAL_API_KEY)",
+        "fal_configure": bool(FAL_API_KEY),
+        "model": FAL_MODEL,
         "tarifs": {
             "video_5s": "~0.25$ (Fal.ai)",
             "video_10s": "~0.50$ (Fal.ai)",
         },
         "endpoints": {
             "creer_cle": "POST /admin/create-key",
-            "generer_video": "POST /v1/video  (header: Authorization: Bearer mak_xxx)",
+            "generer_video": "POST /v1/video  (Authorization: Bearer mak_xxx)",
             "statut_job": "GET /v1/jobs/{id}",
             "liste_jobs": "GET /v1/jobs",
         },
-        "configuration": {
-            "fal_configure": bool(FAL_API_KEY),
-            "replicate_configure": bool(REPLICATE_API_TOKEN),
-            "provider_defaut": DEFAULT_PROVIDER or "AUCUN (configurez FAL_API_KEY ou REPLICATE_API_TOKEN)"
-        },
-        "documentation": "/docs"
+        "documentation": f"{PUBLIC_BASE_URL}/docs",
     }
+
 
 @app.post("/admin/create-key")
 def create_key(name: Optional[str] = "default"):
     raw, hashed = generate_api_key()
     conn = get_db()
-    key_id = str(uuid.uuid4())
+    key_id = "key_" + uuid.uuid4().hex
     conn.execute(
         "INSERT INTO api_keys (id, key_hash, name, created_at) VALUES (?, ?, ?, ?)",
-        (key_id, hashed, name, datetime.now(timezone.utc).isoformat())
+        (key_id, hashed, name, now_iso())
     )
     conn.commit()
     conn.close()
@@ -305,16 +264,16 @@ def create_key(name: Optional[str] = "default"):
         "key_id": key_id,
         "name": name,
         "message": "Conservez cette clé, elle ne sera plus affichée !",
-        "utilisation": "Ajoutez le header: Authorization: Bearer " + raw
+        "utilisation": f"Authorization: Bearer {raw}",
     }
 
+
 @app.post("/v1/video", response_model=JobResponse)
-async def create_video(
+def create_video(
     request: VideoRequest,
     background_tasks: BackgroundTasks,
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(default=None),
 ):
-    # Vérification clé API
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Header Authorization manquant. Format: Bearer mak_xxx")
     key = authorization.replace("Bearer ", "").strip()
@@ -322,12 +281,11 @@ async def create_video(
     if not user:
         raise HTTPException(status_code=401, detail="Clé API invalide")
 
-    # Sélection du provider
     provider = request.provider or DEFAULT_PROVIDER
     if not provider:
         raise HTTPException(
             status_code=503,
-            detail="Aucun provider GPU configuré. Ajoutez FAL_API_KEY ou REPLICATE_API_TOKEN dans Render > Environment."
+            detail="Aucun provider GPU configuré. Ajoutez FAL_API_KEY dans Render > Environment."
         )
 
     params = {
@@ -335,32 +293,29 @@ async def create_video(
         "fps": request.fps,
         "width": request.width,
         "height": request.height,
+        "seed": request.seed,
     }
-    cost = request.seconds * PRICING[provider]["per_second"]
 
-    job_id = "job_" + str(uuid.uuid4())[:8]
+    job_id = "job_" + uuid.uuid4().hex[:8]
     conn = get_db()
     conn.execute(
-        "INSERT INTO jobs (id, api_key_id, status, provider, prompt, params, cost_estimate, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (job_id, user["id"], "queued", provider, request.prompt,
-         json.dumps(params), cost,
-         datetime.now(timezone.utc).isoformat(),
-         datetime.now(timezone.utc).isoformat())
+        "INSERT INTO jobs (id, api_key_id, status, provider, prompt, params, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        (job_id, user["id"], "queued", provider, request.prompt, json.dumps(params), now_iso(), now_iso())
     )
     conn.commit()
     conn.close()
 
-    background_tasks.add_task(process_video_job, job_id, request.prompt, params, provider, user["id"])
+    background_tasks.add_task(process_video_job, job_id, request.prompt, params, provider)
 
     return JobResponse(
         id=job_id,
         status="queued",
-        estimated_cost_usd=round(cost, 3),
-        message=f"Job créé ! Vérifiez le statut sur /v1/jobs/{job_id} dans 30-60 secondes."
+        message=f"Job créé ! Vérifiez le statut sur /v1/jobs/{job_id} dans 30-90 secondes."
     )
 
+
 @app.get("/v1/jobs/{job_id}", response_model=JobStatus)
-def get_job(job_id: str, authorization: Optional[str] = Header(None)):
+def get_job(job_id: str, authorization: Optional[str] = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Header Authorization manquant")
     key = authorization.replace("Bearer ", "").strip()
@@ -374,21 +329,20 @@ def get_job(job_id: str, authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=404, detail="Job introuvable")
 
     job = dict(row)
-    progress = {"queued": 0, "processing": 50, "completed": 100, "failed": 0}.get(job["status"], 0)
     return JobStatus(
         id=job["id"],
         status=job["status"],
         prompt=job["prompt"],
         provider=job.get("provider"),
-        cost_usd=job.get("cost_estimate"),
         result_url=job.get("result_url"),
         error=job.get("error"),
         created_at=job["created_at"],
-        progress=progress
+        updated_at=job["updated_at"],
     )
 
+
 @app.get("/v1/jobs")
-def list_jobs(authorization: Optional[str] = Header(None)):
+def list_jobs(authorization: Optional[str] = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Header Authorization manquant")
     key = authorization.replace("Bearer ", "").strip()
@@ -398,7 +352,7 @@ def list_jobs(authorization: Optional[str] = Header(None)):
 
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, status, prompt, provider, cost_estimate, result_url, created_at FROM jobs WHERE api_key_id = ? ORDER BY created_at DESC LIMIT 50",
+        "SELECT id, status, prompt, provider, result_url, created_at, updated_at FROM jobs WHERE api_key_id = ? ORDER BY created_at DESC LIMIT 50",
         (user["id"],)
     ).fetchall()
     conn.close()
