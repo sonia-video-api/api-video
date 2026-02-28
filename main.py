@@ -26,10 +26,13 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
 DEFAULT_PROVIDER = "fal" if FAL_API_KEY else ("replicate" if REPLICATE_API_TOKEN else None)
 
+# Clé API fixe via variable d'environnement (survit aux redémarrages)
+STATIC_API_KEY = os.getenv("STATIC_API_KEY")  # ex: mak_sonia_production_key
+
 app = FastAPI(
     title=APP_NAME,
     description="API de génération de vidéos IA — Render + GPU externe Fal.ai",
-    version="3.1.0"
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -101,6 +104,9 @@ def generate_api_key():
 def verify_key(key: str) -> Optional[dict]:
     if not key or not key.startswith("mak_"):
         return None
+    # Vérifier d'abord la clé statique (survit aux redémarrages)
+    if STATIC_API_KEY and key == STATIC_API_KEY:
+        return {"id": "static_key", "name": "static", "key_hash": hash_key(key)}
     conn = get_db()
     row = conn.execute(
         "SELECT * FROM api_keys WHERE key_hash = ?", (hash_key(key),)
@@ -230,7 +236,7 @@ def process_video_job(job_id: str, prompt: str, params: dict, provider: str):
 def home():
     return {
         "name": APP_NAME,
-        "version": "3.1.0",
+        "version": "3.2.0",
         "provider_defaut": DEFAULT_PROVIDER or "AUCUN (configurez FAL_API_KEY)",
         "fal_configure": bool(FAL_API_KEY),
         "model": FAL_MODEL,
