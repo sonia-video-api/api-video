@@ -19,7 +19,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://api-video-4ajs.onrender.
 
 # Fal.ai
 FAL_API_KEY = os.getenv("FAL_API_KEY")
-FAL_MODEL = os.getenv("FAL_MODEL", "fal-ai/fast-video")
+FAL_MODEL = os.getenv("FAL_MODEL", "fal-ai/wan/v2.2/t2v-480p")
 
 # Replicate (optionnel)
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -29,7 +29,7 @@ DEFAULT_PROVIDER = "fal" if FAL_API_KEY else ("replicate" if REPLICATE_API_TOKEN
 app = FastAPI(
     title=APP_NAME,
     description="API de génération de vidéos IA — Render + GPU externe Fal.ai",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -230,7 +230,7 @@ def process_video_job(job_id: str, prompt: str, params: dict, provider: str):
 def home():
     return {
         "name": APP_NAME,
-        "version": "3.0.0",
+        "version": "3.1.0",
         "provider_defaut": DEFAULT_PROVIDER or "AUCUN (configurez FAL_API_KEY)",
         "fal_configure": bool(FAL_API_KEY),
         "model": FAL_MODEL,
