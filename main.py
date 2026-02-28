@@ -19,7 +19,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://api-video-4ajs.onrender.
 
 # Fal.ai
 FAL_API_KEY = os.getenv("FAL_API_KEY")
-FAL_MODEL = os.getenv("FAL_MODEL", "fal-ai/wan/v2.2/t2v-480p")
+FAL_MODEL = os.getenv("FAL_MODEL", "fal-ai/wan-t2v")
 
 # Replicate (optionnel)
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -32,7 +32,7 @@ STATIC_API_KEY = os.getenv("STATIC_API_KEY")  # ex: mak_sonia_production_key
 app = FastAPI(
     title=APP_NAME,
     description="API de génération de vidéos IA — Render + GPU externe Fal.ai",
-    version="3.2.0"
+    version="3.3.0"
 )
 
 app.add_middleware(
